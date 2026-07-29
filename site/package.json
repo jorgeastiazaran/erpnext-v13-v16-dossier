@@ -1,0 +1,17 @@
+{
+  "name": "erpnext-migration-dossier",
+  "version": "1.0.0",
+  "description": "Mini sitio web interactivo para el dossier de migración ERPNext v13 → v16",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "marked": "^15.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
