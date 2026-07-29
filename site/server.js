@@ -2,6 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { marked } = require('marked');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,9 +28,40 @@ if (!fs.existsSync(FEEDBACK_FILE)) {
   fs.writeFileSync(FEEDBACK_FILE, JSON.stringify({ evaluators: {}, feedback: {} }, null, 2));
 }
 
+// ── PostgreSQL Setup ─────────────────────────────────────
+const DATABASE_URL = process.env.DATABASE_URL;
+let pgPool = null;
+
+if (DATABASE_URL) {
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  });
+
+  // Create table if not exists
+  const initDbQuery = `
+    CREATE TABLE IF NOT EXISTS uat_feedback (
+      evaluator VARCHAR(255) NOT NULL,
+      test_id VARCHAR(255) NOT NULL,
+      module VARCHAR(255),
+      status VARCHAR(50),
+      severity VARCHAR(50),
+      comment TEXT,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (evaluator, test_id)
+    );
+  `;
+
+  pgPool.query(initDbQuery)
+    .then(() => console.log('✅ PostgreSQL table uat_feedback ready'))
+    .catch(err => console.error('❌ Error initializing PostgreSQL table:', err));
+} else {
+  console.log('ℹ️ DATABASE_URL not set — using local JSON file storage');
+}
+
 // ── Helpers ──────────────────────────────────────────────
 
-function readFeedback() {
+function readFeedbackJSON() {
   try {
     return JSON.parse(fs.readFileSync(FEEDBACK_FILE, 'utf8'));
   } catch {
@@ -37,8 +69,77 @@ function readFeedback() {
   }
 }
 
-function writeFeedback(data) {
+function writeFeedbackJSON(data) {
   fs.writeFileSync(FEEDBACK_FILE, JSON.stringify(data, null, 2));
+}
+
+async function getAllFeedback() {
+  if (pgPool) {
+    try {
+      const res = await pgPool.query('SELECT * FROM uat_feedback ORDER BY updated_at DESC');
+      const feedback = {};
+      const evaluators = {};
+
+      for (const row of res.rows) {
+        const key = `${row.evaluator}::${row.test_id}`;
+        evaluators[row.evaluator] = { name: row.evaluator, registeredAt: row.updated_at };
+        feedback[key] = {
+          evaluator: row.evaluator,
+          testId: row.test_id,
+          module: row.module || '',
+          status: row.status || 'pending',
+          severity: row.severity || '',
+          comment: row.comment || '',
+          updatedAt: row.updated_at,
+        };
+      }
+      return { evaluators, feedback };
+    } catch (err) {
+      console.error('PG query error, fallback to JSON:', err.message);
+      return readFeedbackJSON();
+    }
+  } else {
+    return readFeedbackJSON();
+  }
+}
+
+async function saveSingleFeedback(evaluator, testId, status, severity, comment, module) {
+  const updatedAt = new Date().toISOString();
+
+  if (pgPool) {
+    const query = `
+      INSERT INTO uat_feedback (evaluator, test_id, module, status, severity, comment, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (evaluator, test_id)
+      DO UPDATE SET
+        module = EXCLUDED.module,
+        status = EXCLUDED.status,
+        severity = EXCLUDED.severity,
+        comment = EXCLUDED.comment,
+        updated_at = EXCLUDED.updated_at;
+    `;
+
+    await pgPool.query(query, [evaluator, testId, module || '', status || 'pending', severity || '', comment || '', updatedAt]);
+  }
+
+  // Also sync to local JSON
+  const data = readFeedbackJSON();
+  if (!data.evaluators[evaluator]) {
+    data.evaluators[evaluator] = { name: evaluator, registeredAt: updatedAt };
+  }
+  const key = `${evaluator}::${testId}`;
+  data.feedback[key] = {
+    evaluator,
+    testId,
+    module: module || '',
+    status: status || 'pending',
+    severity: severity || '',
+    comment: comment || '',
+    updatedAt,
+  };
+  writeFeedbackJSON(data);
+
+  return data.feedback[key];
 }
 
 // Map of filenames to human-readable titles and short codes
@@ -90,7 +191,6 @@ app.get('/api/docs', (req, res) => {
 app.get('/api/docs/:filename', (req, res) => {
   try {
     const filename = req.params.filename;
-    // Prevent directory traversal
     if (filename.includes('..') || filename.includes('/')) {
       return res.status(400).json({ error: 'Invalid filename' });
     }
@@ -117,14 +217,13 @@ app.get('/api/docs/:filename', (req, res) => {
 });
 
 // GET /api/feedback — return all feedback data
-app.get('/api/feedback', (req, res) => {
-  const data = readFeedback();
+app.get('/api/feedback', async (req, res) => {
+  const data = await getAllFeedback();
   res.json(data);
 });
 
 // POST /api/feedback — save/update feedback for a test
-// Body: { evaluator, testId, status, severity, comment, module }
-app.post('/api/feedback', (req, res) => {
+app.post('/api/feedback', async (req, res) => {
   try {
     const { evaluator, testId, status, severity, comment, module } = req.body;
 
@@ -132,42 +231,19 @@ app.post('/api/feedback', (req, res) => {
       return res.status(400).json({ error: 'evaluator and testId are required' });
     }
 
-    const data = readFeedback();
-
-    // Register evaluator if new
-    if (!data.evaluators[evaluator]) {
-      data.evaluators[evaluator] = {
-        name: evaluator,
-        registeredAt: new Date().toISOString(),
-      };
-    }
-
-    // Create feedback key
-    const key = `${evaluator}::${testId}`;
-    data.feedback[key] = {
-      evaluator,
-      testId,
-      module: module || '',
-      status: status || 'pending',    // 'pass', 'fail', 'not_executed', 'pending'
-      severity: severity || '',        // 'critical', 'major', 'minor', 'cosmetic'
-      comment: comment || '',
-      updatedAt: new Date().toISOString(),
-    };
-
-    writeFeedback(data);
-    res.json({ success: true, feedback: data.feedback[key] });
+    const saved = await saveSingleFeedback(evaluator, testId, status, severity, comment, module);
+    res.json({ success: true, feedback: saved });
   } catch (err) {
     res.status(500).json({ error: 'Error saving feedback', details: err.message });
   }
 });
 
 // GET /api/summary — return progress summary by module
-app.get('/api/summary', (req, res) => {
+app.get('/api/summary', async (req, res) => {
   try {
-    const data = readFeedback();
+    const data = await getAllFeedback();
     const evaluator = req.query.evaluator || null;
 
-    // Count tests per module from the docs
     const testCounts = {};
     const files = fs.readdirSync(DOCS_DIR).filter(f => f.endsWith('.md'));
 
@@ -189,11 +265,9 @@ app.get('/api/summary', (req, res) => {
       }
     }
 
-    // Count feedback status per module
     for (const [key, fb] of Object.entries(data.feedback)) {
       if (evaluator && fb.evaluator !== evaluator) continue;
 
-      // Find which module this test belongs to
       for (const [moduleCode, moduleData] of Object.entries(testCounts)) {
         if (moduleData.testIds.some(tid => fb.testId.startsWith(tid))) {
           if (fb.status === 'pass') moduleData.pass++;
@@ -204,7 +278,6 @@ app.get('/api/summary', (req, res) => {
       }
     }
 
-    // Calculate pending
     for (const moduleData of Object.values(testCounts)) {
       moduleData.pending = moduleData.total - moduleData.pass - moduleData.fail - moduleData.not_executed;
     }
@@ -216,8 +289,8 @@ app.get('/api/summary', (req, res) => {
 });
 
 // GET /api/feedback/export — export all feedback as CSV
-app.get('/api/feedback/export', (req, res) => {
-  const data = readFeedback();
+app.get('/api/feedback/export', async (req, res) => {
+  const data = await getAllFeedback();
   const rows = [['Evaluador', 'ID Prueba', 'Módulo', 'Estado', 'Severidad', 'Comentario', 'Fecha'].join(',')];
 
   for (const fb of Object.values(data.feedback)) {
